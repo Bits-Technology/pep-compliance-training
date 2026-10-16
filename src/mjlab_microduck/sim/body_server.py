@@ -436,7 +436,115 @@ class Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
-def run(world: World, headless: bool) -> None:
+# ── the viewer's camera, without a mouse ─────────────────────────────────────
+#
+# The passive viewer opens on a free camera that only a mouse can move, and a duck that walks off
+# or rolls over leaves the frame. `--view follow` locks the camera on the first duck's trunk at a
+# distance, azimuth and elevation that keep a 12 cm robot filling the window, and the keyboard
+# steers it from there: arrows orbit and tilt, Page Up/Down zoom. Home is the follow view, End is
+# the viewer's own free camera — the overview it opened with, remembered before the follow took
+# over — and each resets its view when pressed again; the same keys steer whichever is on, so the
+# free camera is usable without a mouse too.
+#
+# **The viewer keeps its own bindings and gets them first**, so the keys here are the ones it
+# leaves alone: every letter toggles a display flag (F is contact forces, which is what a
+# "follow" key on F produced), the digits hide geometry groups, Left/Right step a paused
+# simulation, Page Up selects a parent body, and Tab, Space, Backspace, [ ] and + - are taken
+# too. Home, End, Up/Down and Page Down are free. GLFW key codes name physical keys, so the
+# arrows are the arrows on any layout.
+
+DEFAULT_VIEW = (0.7, 135.0, -20.0)
+"""Metres from the trunk, degrees around it, degrees above it (negative looks down)."""
+
+_KEY_LEFT, _KEY_RIGHT, _KEY_DOWN, _KEY_UP = 263, 262, 264, 265
+_KEY_PAGE_UP, _KEY_PAGE_DOWN, _KEY_HOME, _KEY_END = 266, 267, 268, 269
+
+
+def parse_view(spec: str | None) -> tuple[float, float, float] | None:
+    """`follow`, `follow:<distance>,<azimuth>,<elevation>` (any trailing ones omitted keep their
+    defaults), or `free` / nothing for the viewer's own camera."""
+    if spec is None:
+        return None
+    spec = spec.strip()
+    if spec in ("", "free"):
+        return None
+    head, _, rest = spec.partition(":")
+    if head != "follow":
+        raise SystemExit(f"--view {spec!r}: expected 'free', 'follow' or 'follow:<m>,<deg>,<deg>'")
+    values = list(DEFAULT_VIEW)
+    for index, word in enumerate(w for w in rest.split(",") if w.strip()):
+        if index >= 3:
+            raise SystemExit(f"--view {spec!r}: at most distance, azimuth, elevation")
+        try:
+            values[index] = float(word)
+        except ValueError as error:
+            raise SystemExit(f"--view {spec!r}: {word.strip()!r} is not a number") from error
+    if values[0] <= 0:
+        raise SystemExit(f"--view {spec!r}: the distance must be positive")
+    return values[0], values[1], values[2]
+
+
+class FollowCamera:
+    """The viewer's camera, steered from the keyboard: locked on a body (Home), or the free
+    overview the viewer opened with (End)."""
+
+    def __init__(self, cam, body_id: int, view: tuple[float, float, float]):
+        self.cam = cam
+        self.body_id = body_id
+        # Two views, each with its own numbers and its own reset point. The free one is what the
+        # viewer chose before this took over: its look-at point and framing, kept so F gives back
+        # exactly the picture there was.
+        self.follow_home = view
+        self.follow = list(view)
+        self.free_home = (list(cam.lookat), cam.distance, cam.azimuth, cam.elevation)
+        self.free = [cam.distance, cam.azimuth, cam.elevation]
+        self.following = True
+        self.apply()
+
+    def apply(self) -> None:
+        if self.following:
+            self.cam.type = int(mujoco.mjtCamera.mjCAMERA_TRACKING)
+            self.cam.trackbodyid = self.body_id
+            distance, azimuth, elevation = self.follow
+        else:
+            self.cam.type = int(mujoco.mjtCamera.mjCAMERA_FREE)
+            self.cam.trackbodyid = -1
+            self.cam.lookat[:] = self.free_home[0]
+            distance, azimuth, elevation = self.free
+        self.cam.distance = distance
+        self.cam.azimuth = azimuth
+        self.cam.elevation = max(-89.0, min(89.0, elevation))
+
+    def key(self, keycode: int) -> None:
+        view = self.follow if self.following else self.free
+        if keycode == _KEY_LEFT:
+            view[1] -= 10.0
+        elif keycode == _KEY_RIGHT:
+            view[1] += 10.0
+        elif keycode == _KEY_UP:
+            view[2] -= 5.0
+        elif keycode == _KEY_DOWN:
+            view[2] += 5.0
+        elif keycode == _KEY_PAGE_UP:
+            view[0] = max(0.1, view[0] / 1.2)
+        elif keycode == _KEY_PAGE_DOWN:
+            view[0] = min(20.0, view[0] * 1.2)
+        elif keycode == _KEY_HOME:
+            # Already following: back to where the follow view started.
+            if self.following:
+                self.follow = list(self.follow_home)
+            self.following = True
+        elif keycode == _KEY_END:
+            # Already free: back to the overview as the viewer opened it.
+            if not self.following:
+                self.free = list(self.free_home[1:])
+            self.following = False
+        else:
+            return
+        self.apply()
+
+
+def run(world: World, headless: bool, view: tuple[float, float, float] | None = None) -> None:
     """Step in real time.
 
     **Real time, not as fast as possible.** The daemon's loop is wall-clock and its health gate
@@ -448,11 +556,27 @@ def run(world: World, headless: bool) -> None:
         try:
             import mujoco.viewer
 
+            # The follow camera, once the viewer exists; the key callback is handed over before
+            # that, so it looks it up each time rather than closing over it.
+            follow: list[FollowCamera] = []
+
+            def on_key(keycode: int) -> None:
+                for camera in follow:
+                    camera.key(keycode)
+
             # No side panels: this window is for watching ducks, and everything the panels would
             # drive belongs to the daemons.
             viewer = mujoco.viewer.launch_passive(
-                world.model, world.data, show_left_ui=False, show_right_ui=False
+                world.model,
+                world.data,
+                show_left_ui=False,
+                show_right_ui=False,
+                key_callback=on_key,
             )
+            if view is not None:
+                trunk = mujoco.mj_name2id(world.model, mujoco.mjtObj.mjOBJ_BODY, "trunk_base")
+                with viewer.lock():
+                    follow.append(FollowCamera(viewer.cam, trunk, view))
         except Exception as error:
             print(f"== no viewer ({error}); running headless", flush=True)
 
@@ -510,6 +634,14 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7801, help="the first duck's port; +1 each")
     parser.add_argument("--headless", action="store_true", help="no viewer window")
+    parser.add_argument(
+        "--view",
+        default=None,
+        help="the viewer's camera: 'free' (the default, mouse-driven) or 'follow' — locked on the "
+        "first duck, optionally 'follow:<distance m>,<azimuth deg>,<elevation deg>'; arrows "
+        "orbit and tilt, Page Up/Down zoom, Home is the follow view, End the free overview, "
+        "and each resets its view when pressed again",
+    )
     parser.add_argument(
         "--cameras",
         default="",
@@ -577,7 +709,7 @@ def main() -> None:
         eye = f" · camera on {args.host}:{args.frame_port + index}" if index in wanted else ""
         print(f"==   duck {index}: robotd --sim {args.host}:{args.port + index}{eye}", flush=True)
 
-    run(world, headless=args.headless)
+    run(world, headless=args.headless, view=parse_view(args.view))
 
 
 if __name__ == "__main__":
