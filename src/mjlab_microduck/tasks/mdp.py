@@ -7770,18 +7770,42 @@ def _bow_target_pitch(env: ManagerBasedRlEnv, command_name: str, bow_pitch: floa
     return _posture_blend(env, command_name) * bow_pitch
 
 
+def _standing_height_gate(
+    env: ManagerBasedRlEnv, asset: Entity, height_low: float | None, height_high: float | None
+) -> torch.Tensor:
+    """Smoothstep on trunk z: 1 at or above ``height_high``, 0 at or below ``height_low``.
+
+    The bow's anti-kneel: bow-v2 held a perfect 38° from the floor, trunk at 36 mm, because an
+    additive height reward was a small price next to everything the tilt and stillness paid. As
+    a multiplying gate, a fold that is not at standing height earns nothing for folding — the
+    sit-stand composite's lesson that partial-sum compromises collapse to ~0. ``None`` on either
+    bound disables the gate (returns ones).
+    """
+    if height_low is None or height_high is None:
+        return torch.ones(env.num_envs, device=env.device)
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    t = torch.clamp((z - height_low) / max(height_high - height_low, 1e-6), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
 def bow_pitch_track(
     env: ManagerBasedRlEnv,
     command_name: str,
     bow_pitch: float,
     std: float = math.radians(7.0),
+    height_low: float | None = None,
+    height_high: float | None = None,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """THE bow term: Gaussian on the trunk's forward pitch against the commanded, slewed bow
-    angle — 0 while standing is asked, ``bow_pitch`` while the bow is, the ramp between."""
+    angle — 0 while standing is asked, ``bow_pitch`` while the bow is, the ramp between —
+    multiplied by the standing-height gate, so a fold from the floor earns nothing."""
     asset = env.scene[asset_cfg.name]
     err = _trunk_forward_pitch(asset) - _bow_target_pitch(env, command_name, bow_pitch)
-    return torch.exp(-((err / std) ** 2))
+    gate = _standing_height_gate(env, asset, height_low, height_high)
+    return torch.exp(-((err / std) ** 2)) * gate
 
 
 def bow_pitch_l1(
@@ -7814,12 +7838,16 @@ def bow_stillness(
     band_full: float = math.radians(3.0),
     band_zero: float = math.radians(10.0),
     vel_std: float = 0.05,
+    height_low: float | None = None,
+    height_high: float | None = None,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Trunk stillness while AT the commanded pitch and the ramp is done — standing or bowed —
     so resting quietly in either posture is the peak of the stack and a held bow is a still bow.
-    Gated to zero mid-transition, as ``posture_stillness`` is."""
+    Gated to zero mid-transition, as ``posture_stillness`` is, and by the standing-height gate:
+    kneeling quietly is not the rest this pays for."""
     asset = env.scene[asset_cfg.name]
+    gate = _standing_height_gate(env, asset, height_low, height_high)
     err = torch.abs(_trunk_forward_pitch(asset) - _bow_target_pitch(env, command_name, bow_pitch))
     t = torch.clamp((band_zero - err) / max(band_zero - band_full, 1e-6), 0.0, 1.0)
     pitch_gate = t * t * (3.0 - 2.0 * t)
@@ -7829,4 +7857,4 @@ def bow_stillness(
     ramp_done = ((flag - blend).abs() < 0.02).float()
 
     v = torch.nan_to_num(asset.data.root_link_lin_vel_w, nan=0.0).norm(dim=-1)
-    return torch.exp(-((v / vel_std) ** 2)) * pitch_gate * ramp_done
+    return torch.exp(-((v / vel_std) ** 2)) * pitch_gate * ramp_done * gate

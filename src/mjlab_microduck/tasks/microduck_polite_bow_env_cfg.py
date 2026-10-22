@@ -34,8 +34,11 @@ Reward design — each term and what it is for:
   trunk_roll        — no sideways lean: the fold is sagittal.
   feet_grounded     — both feet stay planted, always on: lifting one costs every step, which
                       rules out stepping or hopping into the bow.
-  height_stand      — the trunk stays near standing height (loose std): rules out the
-                      crouch-and-nod, the cheapest way to tilt a trunk.
+  height_stand,     — the trunk stays near standing height: a Gaussian for the shape and an
+  height_l1           L1 for a gradient that reaches all the way down. On their own these were
+                      not enough — bow-v2 kneeled at 36 mm and held a perfect tilt from the
+                      floor — which is why the two terms above are also GATED on standing
+                      height (BOW_GATE_LOW..HIGH): a fold that is not standing earns nothing.
   pose_stand_legs   — legs pulled gently toward HOME (loose std): the fold must stay
                       affordable, but the robot comes back to where it started.
   bow_stillness     — rest quietly AT the commanded pitch once the ramp is done, standing or
@@ -101,6 +104,12 @@ BOW_RAMP_S = 1.2
 
 # Trunk standing height (measured natural equilibrium at HOME — see standup env).
 STAND_Z = 0.115
+# The standing-height gate on the bow rewards: full above BOW_GATE_HIGH, nothing below
+# BOW_GATE_LOW. A fold from the hips keeps the trunk base near STAND_Z (the hips do not drop);
+# bow-v2 kneeled to 36 mm and still collected the tilt and stillness rewards, so from v3 a tilt
+# below standing height is worth nothing — the kneel has to pay for itself, and it cannot.
+BOW_GATE_LOW  = 0.090
+BOW_GATE_HIGH = 0.105
 
 # Where the head goes at the bottom, as ABSOLUTE joint angles (HOME is +0.349 on both):
 # the neck a little forward, the head pitched well down — head_pitch positive is down, and
@@ -202,7 +211,13 @@ def make_microduck_polite_bow_env_cfg(play: bool = False) -> ManagerBasedRlEnvCf
     cfg.rewards["bow_pitch_track"] = RewardTermCfg(
         func=microduck_mdp.bow_pitch_track,
         weight=4.0,
-        params={"command_name": "twist", "bow_pitch": BOW_PITCH, "std": math.radians(7.0)},
+        params={
+            "command_name": "twist",
+            "bow_pitch":    BOW_PITCH,
+            "std":          math.radians(7.0),
+            "height_low":   BOW_GATE_LOW,
+            "height_high":  BOW_GATE_HIGH,
+        },
     )
     # POSITIVE weight: bow_pitch_l1 returns −|error| already (a self-negating microduck
     # penalty), so a negative weight would double-negate into a reward for being far from the
@@ -235,9 +250,20 @@ def make_microduck_polite_bow_env_cfg(play: bool = False) -> ManagerBasedRlEnvCf
     )
     cfg.rewards["height_stand"] = RewardTermCfg(
         func=microduck_mdp.height_target_gaussian,
-        weight=1.0,
+        weight=2.0,
         params={
-            "std":           0.03,
+            "std":           0.02,
+            "target_height": STAND_Z,
+            "asset_cfg":     SceneEntityCfg("robot", body_names=("trunk_base",)),
+        },
+    )
+    # The constant-gradient companion (self-negating → POSITIVE weight): leaving standing
+    # height costs every step by how far, so the kneel bow-v2 found is paid for all the way
+    # down and all the way back — the Gaussian above has no gradient left at 36 mm.
+    cfg.rewards["height_l1"] = RewardTermCfg(
+        func=microduck_mdp.height_l1_penalty,
+        weight=10.0,
+        params={
             "target_height": STAND_Z,
             "asset_cfg":     SceneEntityCfg("robot", body_names=("trunk_base",)),
         },
@@ -250,7 +276,12 @@ def make_microduck_polite_bow_env_cfg(play: bool = False) -> ManagerBasedRlEnvCf
     cfg.rewards["bow_stillness"] = RewardTermCfg(
         func=microduck_mdp.bow_stillness,
         weight=1.0,
-        params={"command_name": "twist", "bow_pitch": BOW_PITCH},
+        params={
+            "command_name": "twist",
+            "bow_pitch":    BOW_PITCH,
+            "height_low":   BOW_GATE_LOW,
+            "height_high":  BOW_GATE_HIGH,
+        },
     )
 
     # ── Sim2real regularisers — velocity parity ───────────────────────────────

@@ -66,7 +66,7 @@ def test_reward_signs_are_the_intended_ones():
     assert r["bow_head_pose"].weight > 0
     assert r["bow_head_pose"].params["sit_overrides"] == BOW_HEAD_OVERRIDES
     assert r["bow_head_pose"].params["joint_indices"] == [5, 6, 7, 8]
-    for positive in ("trunk_roll", "feet_grounded", "height_stand", "pose_stand_legs", "bow_stillness"):
+    for positive in ("trunk_roll", "feet_grounded", "height_stand", "height_l1", "pose_stand_legs", "bow_stillness"):
         assert r[positive].weight > 0, positive
     for negative in ("action_rate_l2", "body_ang_vel", "angular_momentum", "self_collisions"):
         assert r[negative].weight < 0, negative
@@ -81,6 +81,27 @@ def test_the_l1_term_is_self_negating():
     # And the weighted sign the run will log: positive weight × (−|err|) ≤ 0.
     r = make_microduck_polite_bow_env_cfg().rewards
     assert r["bow_pitch_l1"].weight * (-0.3) <= 0
+
+
+def test_the_bow_rewards_are_gated_on_standing_height():
+    """bow-v2 kneeled: trunk at 36 mm, tilt perfect, stillness paid. A fold earns nothing below
+    the gate, and the gate is below a hip-fold's trunk height but above a kneel's."""
+    from mjlab_microduck.tasks.microduck_polite_bow_env_cfg import BOW_GATE_HIGH, BOW_GATE_LOW
+
+    r = make_microduck_polite_bow_env_cfg().rewards
+    for term in ("bow_pitch_track", "bow_stillness"):
+        assert r[term].params["height_low"] == BOW_GATE_LOW, term
+        assert r[term].params["height_high"] == BOW_GATE_HIGH, term
+    assert 0.036 < BOW_GATE_LOW < BOW_GATE_HIGH < 0.115
+    assert r["height_l1"].weight > 0, "self-negating penalty: positive weight"
+
+    # The gate itself: ones when disabled, zero at a kneel, one standing, smooth between.
+    env = SimpleNamespace(num_envs=4, device="cpu", scene=SimpleNamespace(terrain=SimpleNamespace(env_origins=torch.zeros(4, 3))))
+    asset = SimpleNamespace(data=SimpleNamespace(root_link_pos_w=torch.tensor([[0, 0, 0.036], [0, 0, 0.0975], [0, 0, 0.115], [0, 0, 0.08]])))
+    gate = mdp._standing_height_gate(env, asset, BOW_GATE_LOW, BOW_GATE_HIGH)
+    assert gate[0].item() == 0.0 and gate[2].item() == 1.0 and gate[3].item() == 0.0
+    assert 0.4 < gate[1].item() < 0.6, "halfway through the band"
+    assert torch.all(mdp._standing_height_gate(env, asset, None, None) == 1.0)
 
 
 def test_the_head_drops_at_the_bottom():
