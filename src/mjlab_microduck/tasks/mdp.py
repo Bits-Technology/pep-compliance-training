@@ -7704,3 +7704,129 @@ def roulade_lateral_velocity_penalty(
     """Body-frame lateral (y) linear velocity² — keeps the roll straight."""
     asset: Entity = env.scene[asset_cfg.name]
     return torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 1].pow(2), nan=0.0)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Polite bow — a commanded two-state, stand ↔ bow, on the sit-stand's machinery
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# The bow is the sit-stand's shape with a different second posture: a flag in the twist vx
+# slot (0 = stand, 1 = bow), dwell-time resampling, and a SLEWED target blend the rewards
+# track — so following the slow setpoint is the argmax and an instant flop never pays (see
+# SitStandCommand for the reasoning). What differs is what the blend means: a trunk forward
+# pitch rather than a trunk height. So the blend is initialised from the trunk's actual pitch
+# at episode start, and the task reward tracks the pitch itself, read off the root quaternion.
+#
+# Deployment: the runtime runs this as a held pose — `policy add bow <repo> --hold <s>
+# --command 1,0,0` writes the flag for `hold` seconds, then the manifest's `unwind` (all
+# zeros, "stand") for `unwind_s` — so how long Pep stays down is the owner's knob, not the
+# network's, and a feed-forward policy needs no clock to hold a bow.
+
+
+def _trunk_forward_pitch(asset: Entity) -> torch.Tensor:
+    """Nose-down tilt of the trunk, radians, from the root quaternion ``[w, x, y, z]``.
+
+    The trunk's x axis in the world has z component ``2(xz − wy)``; nose down makes it
+    negative, so the pitch is ``asin(2(wy − xz))``. Exact for a pure pitch, and the right
+    sign under any roll.
+    """
+    q = asset.data.root_link_quat_w
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    return torch.asin(torch.clamp(2.0 * (w * y - x * z), -1.0, 1.0))
+
+
+def _trunk_roll(asset: Entity) -> torch.Tensor:
+    """Sideways tilt of the trunk, radians: the y axis's world z component is ``2(yz + wx)``."""
+    q = asset.data.root_link_quat_w
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    return torch.asin(torch.clamp(2.0 * (w * x + y * z), -1.0, 1.0))
+
+
+class BowCommand(SitStandCommand):
+    """``[bow_flag, 0, 0]`` with the sit-stand's dwell resampling and slewed blend, where the
+    blend is a fraction of ``cfg.bow_pitch`` rather than of a height drop."""
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        super().__init__(cfg, env)
+        self._bow_pitch = float(getattr(cfg, "bow_pitch", math.radians(37.5)))
+
+    def _alpha_from_height(self) -> torch.Tensor:
+        # The parent's hook, by name: for the bow, "where the robot actually is" is its pitch.
+        pitch = _trunk_forward_pitch(self.robot)
+        return torch.clamp(pitch / max(self._bow_pitch, 1e-6), 0.0, 1.0)
+
+
+@_dataclass(kw_only=True)
+class BowCommandCfg(SitStandCommandCfg):
+    class_type: type = BowCommand
+    # The trunk's forward pitch at the bottom of the bow, radians.
+    bow_pitch: float = math.radians(37.5)
+
+    def build(self, env: ManagerBasedRlEnv) -> "BowCommand":
+        return BowCommand(self, env)
+
+
+def _bow_target_pitch(env: ManagerBasedRlEnv, command_name: str, bow_pitch: float) -> torch.Tensor:
+    return _posture_blend(env, command_name) * bow_pitch
+
+
+def bow_pitch_track(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    bow_pitch: float,
+    std: float = math.radians(7.0),
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """THE bow term: Gaussian on the trunk's forward pitch against the commanded, slewed bow
+    angle — 0 while standing is asked, ``bow_pitch`` while the bow is, the ramp between."""
+    asset = env.scene[asset_cfg.name]
+    err = _trunk_forward_pitch(asset) - _bow_target_pitch(env, command_name, bow_pitch)
+    return torch.exp(-((err / std) ** 2))
+
+
+def bow_pitch_l1(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    bow_pitch: float,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """L1 companion to ``bow_pitch_track`` — the transition driver: resting in the wrong posture
+    costs a constant ~``bow_pitch`` per step, so ignoring the flag is net-negative both ways."""
+    asset = env.scene[asset_cfg.name]
+    err = _trunk_forward_pitch(asset) - _bow_target_pitch(env, command_name, bow_pitch)
+    return -torch.abs(err)
+
+
+def trunk_roll_gaussian(
+    env: ManagerBasedRlEnv,
+    std: float = math.radians(6.0),
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Gaussian on the trunk's sideways tilt: a bow is sagittal, whatever the pitch."""
+    asset = env.scene[asset_cfg.name]
+    return torch.exp(-((_trunk_roll(asset) / std) ** 2))
+
+
+def bow_stillness(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    bow_pitch: float,
+    band_full: float = math.radians(3.0),
+    band_zero: float = math.radians(10.0),
+    vel_std: float = 0.05,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Trunk stillness while AT the commanded pitch and the ramp is done — standing or bowed —
+    so resting quietly in either posture is the peak of the stack and a held bow is a still bow.
+    Gated to zero mid-transition, as ``posture_stillness`` is."""
+    asset = env.scene[asset_cfg.name]
+    err = torch.abs(_trunk_forward_pitch(asset) - _bow_target_pitch(env, command_name, bow_pitch))
+    t = torch.clamp((band_zero - err) / max(band_zero - band_full, 1e-6), 0.0, 1.0)
+    pitch_gate = t * t * (3.0 - 2.0 * t)
+
+    flag = env.command_manager.get_command(command_name)[:, 0]
+    blend = _posture_blend(env, command_name)
+    ramp_done = ((flag - blend).abs() < 0.02).float()
+
+    v = torch.nan_to_num(asset.data.root_link_lin_vel_w, nan=0.0).norm(dim=-1)
+    return torch.exp(-((v / vel_std) ** 2)) * pitch_gate * ramp_done

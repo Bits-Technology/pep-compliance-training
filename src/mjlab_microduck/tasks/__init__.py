@@ -75,6 +75,10 @@ from .microduck_roulade_env_cfg import (
     make_microduck_roulade_env_cfg,
     MicroduckRouladeRlCfg,
 )
+from .microduck_polite_bow_env_cfg import (
+    make_microduck_polite_bow_env_cfg,
+    MicroduckPoliteBowRlCfg,
+)
 from .backlash import make_backlash_variant
 
 # Standard velocity task
@@ -278,3 +282,12 @@ for _task_id, _make_cfg, _kw, _rl_cfg, _robot_cfg in _BACKLASH_TASKS:
         rl_cfg=_rl_cfg,
         runner_cls=MicroduckOnPolicyRunner,
     )
+
+# PoliteBow — a commanded bow from standing, on the sit-stand's flag-and-slew machinery.
+register_mjlab_task(
+    task_id="Mjlab-PoliteBow-Flat-MicroDuck",
+    env_cfg=make_microduck_polite_bow_env_cfg(),
+    play_env_cfg=make_microduck_polite_bow_env_cfg(play=True),
+    rl_cfg=MicroduckPoliteBowRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
