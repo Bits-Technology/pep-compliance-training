@@ -27,6 +27,7 @@ Reward design — each term and what it is for:
                       slow IS the argmax (the sit-stand's anti-crash lesson).
   bow_pitch_l1      — the transition driver: a constant per-step cost for resting in the
                       wrong posture, so ignoring the flag is net-negative in both directions.
+                      Returns −|error| itself, so its weight is POSITIVE (see the term).
   bow_head_pose     — the head follows: neck/head pitch track a target that blends from HOME
                       to BOW_HEAD_OVERRIDES with the same slewed blend — looking ahead at the
                       start, at the floor just ahead at the bottom, and back up with the body.
@@ -203,9 +204,13 @@ def make_microduck_polite_bow_env_cfg(play: bool = False) -> ManagerBasedRlEnvCf
         weight=4.0,
         params={"command_name": "twist", "bow_pitch": BOW_PITCH, "std": math.radians(7.0)},
     )
+    # POSITIVE weight: bow_pitch_l1 returns −|error| already (a self-negating microduck
+    # penalty), so a negative weight would double-negate into a reward for being far from the
+    # target — which is exactly what bow-v1 did for 250 iterations, logging +0.78 for a term
+    # that must read ≤ 0. The playbook's infallible check: every Episode_Reward/<penalty> ≤ 0.
     cfg.rewards["bow_pitch_l1"] = RewardTermCfg(
         func=microduck_mdp.bow_pitch_l1,
-        weight=-2.0,
+        weight=2.0,
         params={"command_name": "twist", "bow_pitch": BOW_PITCH},
     )
     cfg.rewards["bow_head_pose"] = RewardTermCfg(

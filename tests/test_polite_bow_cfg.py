@@ -56,12 +56,13 @@ def test_the_command_is_a_flag_with_a_slewed_pitch_blend():
 
 
 def test_reward_signs_are_the_intended_ones():
-    """Gaussian trackers reward, L1 and costs penalise. A negative weight on a self-negating
-    penalty would reward the violation (the playbook's bit-four-envs lesson)."""
+    """Gaussian trackers reward; mjlab-base costs (≥ 0) take a negative weight; self-negating
+    microduck penalties (≤ 0) take a POSITIVE one. bow-v1 had the L1 the wrong way round and was
+    paid +0.78 a step for pitch error (the playbook's bit-four-envs lesson, now bit five)."""
     r = make_microduck_polite_bow_env_cfg().rewards
     assert r["bow_pitch_track"].weight == 4.0
     assert r["bow_pitch_track"].params["bow_pitch"] == BOW_PITCH
-    assert r["bow_pitch_l1"].weight == -2.0
+    assert r["bow_pitch_l1"].weight > 0, "self-negating penalty: positive weight"
     assert r["bow_head_pose"].weight > 0
     assert r["bow_head_pose"].params["sit_overrides"] == BOW_HEAD_OVERRIDES
     assert r["bow_head_pose"].params["joint_indices"] == [5, 6, 7, 8]
@@ -71,6 +72,15 @@ def test_reward_signs_are_the_intended_ones():
         assert r[negative].weight < 0, negative
     assert "upright" not in r, "the recipe's upright would fight the fold"
     assert "track_linear_velocity" not in r
+
+
+def test_the_l1_term_is_self_negating():
+    """The reason its weight is positive: the function itself never returns above zero."""
+    err = torch.tensor([0.0, 0.3, -0.5])
+    assert torch.all(-torch.abs(err) <= 0)
+    # And the weighted sign the run will log: positive weight × (−|err|) ≤ 0.
+    r = make_microduck_polite_bow_env_cfg().rewards
+    assert r["bow_pitch_l1"].weight * (-0.3) <= 0
 
 
 def test_the_head_drops_at_the_bottom():
